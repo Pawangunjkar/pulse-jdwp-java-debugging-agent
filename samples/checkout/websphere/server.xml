@@ -1,0 +1,2 @@
+<!-- WebSphere server.xml genericJvmArguments, read by startServer. -->
+<jvmEntries genericJvmArguments="-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5012" />

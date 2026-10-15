@@ -1,0 +1,19 @@
+[project]
+name = "pulse-jdwp-java-debugging-agent"
+version = "0.1.0"
+description = "PulseJDWP java-debugging-agent — LangGraph remote Java JDWP debugger with Linux SSH MCP and a Pulse operator console"
+requires-python = ">=3.11"
+authors = [{ name = "Pawan Gunjkar", email = "pawangunjkar@gmail.com" }]
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
+    "langgraph>=0.2.60",
+    "langchain-core>=0.3.0",
+    "mcp>=1.0.0,<2",
+    "httpx>=0.27.0",
+    "pydantic>=2.0.0",
+    "pyyaml>=6.0.0",
+]
+
+[tool.uv]
+package = false

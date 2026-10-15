@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.py[cod]
+.env
+frontend/node_modules/
+frontend/dist/
+data/
+backend/jdwp/classes/
+samples/checkout/classes/
+samples/checkout/jvm-*.log
+samples/checkout/jvm-*.err
+.cursor/mcp.json

@@ -1,0 +1,25 @@
+# PulseJDWP — shell, color, and constraints
+# Grok and other agents must keep these when editing this repo.
+
+SHELL
+- Fixed two-row chrome. Do not add a left sidebar.
+- Global bar 52px. Brand mark 22px plus the name PulseJDWP.
+- Active nav uses accent wash and accent text, not an underline.
+- No user chip, no sign-in, no sign-out.
+- Context bar 44px under the global bar. Breadcrumb left, page actions right.
+- Page body max-width 1560px, centered.
+
+COLOR AND TYPE
+- Dark is the default. The only literal colors live in CSS tokens.
+- Dark surfaces: canvas #0a0c12, default #101319, raised #161a22, sunken #0d1016, hover #1a1f28, active #202634.
+- Dark text: #f4f6fa / #c3cbd9 / #95a1b4.
+- Accent #5b8cff is interactive only. Do not use it for status.
+- Brand amber #f9b848 and magenta #c9317f are reserved for the logo. Nowhere else.
+- Status only: neutral #6b7385, info #4fb3d9, attention #e8a33d, success #2fbf71, danger #f2555a, agent #a47bf0.
+- Type: Inter, 14px body. Mono is JetBrains Mono at 12px for logs, stack traces, and ids.
+
+DO NOT
+- Do not add a sign-in page, a credential form, a session gate, or a user menu.
+- Do not add a left navigation rail, hero marketing sections, gradients on cards, or a second accent color.
+- Do not show jobs, servers, or tickets as the unit of the UI. The unit is Application Target and its Debug Session.
+- Do not invent status colors outside the six above.
