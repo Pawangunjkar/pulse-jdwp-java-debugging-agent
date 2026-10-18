@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { NavLink, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api, offline, Session, Skill, statusLabel, Target, QueueItem } from "./api";
 import { playFallbackStream } from "./fallback";
@@ -265,6 +265,7 @@ function SessionCard({ session }: { session: Session }) {
     <button className="tile" onClick={() => navigate(`/sessions/${session.id}`)}>
       <Badge status={session.status} />
       <strong style={{ display: "block", marginTop: 8 }}>{session.targetId}</strong>
+      <p className="muted">{[session.runtimeFamily, session.jdwpPort ? `JDWP ${session.jdwpPort}` : "", session.jdwpConnected ? "attached" : ""].filter(Boolean).join(" · ") || session.id}</p>
       <p className="muted">{session.summary}</p>
       <span className="muted">{session.createdAt || session.id}</span>
     </button>
@@ -281,19 +282,34 @@ function formatEvent(event: Session["events"][number]) {
   return `\n[${event.kind}${event.event ? ` ${event.event}` : ""}] ${event.command || event.stepper || ""}\n${body}\n`;
 }
 
+function SourceView({ snippet, line }: { snippet: string; line?: number }) {
+  return (
+    <pre className="console">
+      {snippet.split("\n").map((row) => {
+        const match = /^(\d+):/.exec(row);
+        const hit = match !== null && Number(match[1]) === line;
+        return <div key={row} className={hit ? "hit-line" : undefined}>{row}</div>;
+      })}
+    </pre>
+  );
+}
+
 function SessionDetail({ toast }: { toast: (text: string) => void }) {
   const { id = "" } = useParams();
   const [session, setSession] = useState<Session | null>(null);
   const [tab, setTab] = useState("Live Stream & Console");
   const [log, setLog] = useState("");
   const [error, setError] = useState("");
-  function load() {
+  const [expression, setExpression] = useState("taxable");
+  const consoleRef = useRef<HTMLDivElement>(null);
+  function load(resetLog = false) {
     api.session(id).then((row) => {
       setSession(row);
-      if (row.status === "success" || row.status === "danger") setLog(row.events.map(formatEvent).join(""));
+      if (resetLog) setLog(row.events.map(formatEvent).join(""));
     }).catch((exc) => setError(String(exc)));
   }
-  useEffect(load, [id]);
+  useEffect(() => { load(true); }, [id]);
+  useEffect(() => { consoleRef.current?.scrollTo({ top: consoleRef.current.scrollHeight }); }, [log, tab]);
   useEffect(() => {
     if (!session || session.status === "success" || session.status === "danger") return;
     if (offline()) {
@@ -308,29 +324,79 @@ function SessionDetail({ toast }: { toast: (text: string) => void }) {
       const event = JSON.parse(message.data);
       if (event.kind === "llm_token") setLog((text) => text + (event.token || ""));
       else setLog((text) => text + formatEvent(event));
-      if (event.status) setSession((current) => current ? { ...current, status: event.status, stepper: event.stepper || current.stepper } : current);
-      if (event.status === "success" || event.status === "danger") api.session(id).then(setSession).catch(() => undefined);
+      if (event.status) setSession((current) => current ? { ...current, status: event.status, stepper: event.stepper || current.stepper, pending: event.kind === "human_gate" ? current.pending : current.pending } : current);
+      if (event.kind === "human_gate" || event.status === "success" || event.status === "danger") api.session(id).then(setSession).catch(() => undefined);
     };
     source.onerror = () => source.close();
     return () => source.close();
   }, [id, session?.status]);
-  if (error) return <ErrorState detail={error} onRetry={load} />;
+  async function debug(action: string, value = "") {
+    const result = await api.debug(id, action, value);
+    setSession(result.session);
+    setLog((text) => text + result.events.map((event) => formatEvent({ kind: "jdwp_event", at: "", event: event.event, command: event.command, output: event.output, detail: event })).join(""));
+  }
+  if (error) return <ErrorState detail={error} onRetry={() => load(true)} />;
   if (!session) return <div className="skel" />;
   const steps = ["Stack Ingested", "SSH MCP Startup Check", "JDWP Attached", "Breakpoint & Frame Capture", "Root Cause Synthesized"];
   const tabs = ["Live Stream & Console", "Issue Stack & Breakpoints", "Variables & Thread Frames", "Startup Script & JDWP Port", "Attached Skills & Context"];
+  const stopLine = session.frames.find((frame) => frame.applicationFrame)?.line ?? session.breakpoints[0]?.line;
+  const locals = session.variables.flatMap((block) => block.locals || []);
   return (
     <>
       <div className="card">
         <Badge status={session.status} />
         <p>{session.summary}</p>
+        <p className="muted">{[session.runtimeFamily, session.jdwpPort ? `JDWP ${session.jdwpPort}` : "", session.jdwpConnected ? "attached" : "detached"].filter(Boolean).join(" · ")}</p>
         <div className="stepper">{steps.map((step) => <span key={step} className={step === session.stepper ? "on" : ""}>{step}</span>)}</div>
       </div>
+      {session.pending ? (
+        <div className="card" style={{ marginTop: 12 }}>
+          <strong>{session.pending.kind}</strong>
+          <p>{session.pending.summary}</p>
+          {session.pending.diff ? <pre className="console">{session.pending.diff}</pre> : null}
+          <button className="btn primary" onClick={async () => { await api.approve(session.id, true); toast("Human gate approved"); load(true); }}>Approve</button>
+        </div>
+      ) : null}
       <div className="tabs">{tabs.map((item) => <button key={item} className={item === tab ? "on" : ""} onClick={() => setTab(item)}>{item}</button>)}</div>
-      {tab === "Live Stream & Console" ? <div className="console">{log || session.events.map((event) => event.token || event.kind).join("") || "Waiting for SSE frames."}</div> : null}
-      {tab === "Issue Stack & Breakpoints" ? <pre className="console">{session.stack}{"\n\n"}{session.frames.map((frame) => `${frame.className}.${frame.method}:${frame.line}`).join("\n")}</pre> : null}
-      {tab === "Variables & Thread Frames" ? <pre className="console">{JSON.stringify(session.variables, null, 2)}{"\n"}{session.threads.join("\n")}</pre> : null}
+      {tab === "Live Stream & Console" ? (
+        <>
+          {session.jdwpConnected ? (
+            <div className="actions" style={{ marginBottom: 8 }}>
+              <button className="btn secondary" onClick={() => debug("step")}>Step into</button>
+              <button className="btn secondary" onClick={() => debug("next")}>Step over</button>
+              <button className="btn secondary" onClick={() => debug("cont")}>Continue</button>
+              <button className="btn secondary" onClick={() => debug("locals")}>Locals</button>
+              <input aria-label="Expression" value={expression} onChange={(event) => setExpression(event.target.value)} style={{ width: 160 }} />
+              <button className="btn secondary" onClick={() => debug("print", expression)}>Print</button>
+              <button className="btn danger" onClick={() => debug("detach")}>Detach</button>
+            </div>
+          ) : null}
+          <div className="console" ref={consoleRef}>{log || "Waiting for SSE frames."}</div>
+        </>
+      ) : null}
+      {tab === "Issue Stack & Breakpoints" ? (
+        <>
+          <pre className="console">{session.stack}{"\n\n"}{session.frames.map((frame) => `${frame.className}.${frame.method}:${frame.line}`).join("\n")}</pre>
+          {session.sourceSnippet ? <SourceView snippet={session.sourceSnippet} line={stopLine} /> : null}
+        </>
+      ) : null}
+      {tab === "Variables & Thread Frames" ? (
+        <>
+          <table className="table">
+            <thead><tr><th>Local</th><th>Value</th></tr></thead>
+            <tbody>
+              {locals.map((item) => (
+                <tr key={item.name}><td>{item.name}</td><td className={item.value === "null" ? "null-value" : undefined}>{item.value}</td></tr>
+              ))}
+            </tbody>
+          </table>
+          <div className="console" style={{ marginTop: 12 }}>
+            {session.threads.map((frame, index) => <div key={frame} className={index === 0 ? "hit-line" : undefined}>{frame}</div>)}
+          </div>
+        </>
+      ) : null}
       {tab === "Startup Script & JDWP Port" ? <pre className="console">{session.startupScript}{"\nport "}{session.jdwpPort}{"\n"}{session.startupText}</pre> : null}
-      {tab === "Attached Skills & Context" ? <SkillAttach session={session} toast={toast} onSaved={load} /> : null}
+      {tab === "Attached Skills & Context" ? <SkillAttach session={session} toast={toast} onSaved={() => load(false)} /> : null}
     </>
   );
 }
@@ -340,7 +406,7 @@ function SkillAttach({ session, toast, onSaved }: { session: Session; toast: (te
   const [extra, setExtra] = useState(session.extraContext || "");
   useEffect(() => { api.skills().then(setSkills); }, []);
   return (
-    <form className="card" onSubmit={(event) => { event.preventDefault(); toast("Context noted for the next run."); onSaved(); }}>
+    <form className="card" onSubmit={async (event) => { event.preventDefault(); const saved = await api.updateSession(session.id, { extraContext: extra, skillIds: session.skills }); toast("Context saved on this Debug Session"); onSaved(); void saved; }}>
       <p>{session.skills.join(", ") || "No skill selected yet."}</p>
       <label>Extra application context<textarea value={extra} onChange={(event) => setExtra(event.target.value)} /></label>
       <p className="muted">{skills.length} skills available in the catalog.</p>
@@ -381,6 +447,7 @@ function NewSession({ toast }: { toast: (text: string) => void }) {
 
 function QueuePage({ toast }: { toast: (text: string) => void }) {
   const [items, setItems] = useState<QueueItem[] | null>(null);
+  const navigate = useNavigate();
   const buckets = ["Startup Script & JDWP Port Injection", "Thread Suspension & Live Breakpoints", "Root Cause & Remediation Sign-off"];
   function load() { api.queue().then(setItems); }
   useEffect(load, []);
@@ -397,7 +464,10 @@ function QueuePage({ toast }: { toast: (text: string) => void }) {
             {rows.map((item) => (
               <article key={item.sessionId} className="queue-card" style={{ marginBottom: 8 }}>
                 <strong>{item.summary}</strong>
+                {item.line ? <p className="muted">{item.line}</p> : null}
                 <p className="muted">Since {item.waited}</p>
+                {item.diff ? <pre className="console">{item.diff}</pre> : null}
+                <button className="btn secondary" onClick={() => navigate(`/sessions/${item.sessionId}`)}>Open</button>
                 <button className="btn primary" onClick={async () => { await api.approve(item.sessionId, true); toast("Human gate approved"); load(); }}>Approve</button>
               </article>
             ))}
@@ -412,7 +482,9 @@ function Settings({ toast }: { toast: (text: string) => void }) {
   const [skills, setSkills] = useState<Skill[]>([]);
   const [confirmId, setConfirmId] = useState("");
   const navigate = useNavigate();
-  function load() { api.skills().then(setSkills); }
+  const [command, setCommand] = useState("uv");
+  const [patterns, setPatterns] = useState("setenv.sh, start.sh, Dockerfile, *.service");
+  function load() { api.skills().then(setSkills); api.settings().then((row) => { setCommand(row.command); setPatterns(row.patterns); }).catch(() => undefined); }
   useEffect(load, []);
   async function addSkill(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -441,10 +513,10 @@ function Settings({ toast }: { toast: (text: string) => void }) {
         <label>JDWP inspection commands<input name="commands" placeholder="where|locals" /></label>
         <button className="btn primary" type="submit">Save skill</button>
       </form>
-      <form className="card" style={{ marginTop: 12 }} onSubmit={(event) => { event.preventDefault(); toast("SSH MCP settings stay in the backend environment"); }}>
+      <form className="card" style={{ marginTop: 12 }} onSubmit={async (event) => { event.preventDefault(); await api.saveSettings({ command, patterns }); toast("SSH MCP notes saved"); }}>
         <h2 className="h2">Linux SSH MCP</h2>
-        <label>Command<input defaultValue="uv" /></label>
-        <label>Startup script patterns<input defaultValue="setenv.sh, start.sh, Dockerfile, *.service" /></label>
+        <label>Command<input value={command} onChange={(event) => setCommand(event.target.value)} /></label>
+        <label>Startup script patterns<input value={patterns} onChange={(event) => setPatterns(event.target.value)} /></label>
         <button className="btn secondary" type="submit">Save connection notes</button>
       </form>
       <h2 className="h2">Loaded skills</h2>
@@ -488,11 +560,26 @@ function TargetTable({ targets }: { targets: Target[] }) {
 
 function Palette({ query, setQuery, onClose }: { query: string; setQuery: (value: string) => void; onClose: () => void }) {
   const navigate = useNavigate();
-  const items = useMemo(() => ["/ Dashboard", "/catalog Catalog", "/sessions Debug Sessions", "/queue Human Queue", "/settings Settings & Skills"], []);
+  const [items, setItems] = useState<string[]>(["/ Dashboard", "/catalog Catalog", "/sessions Debug Sessions", "/queue Human Queue", "/settings Settings & Skills"]);
+  useEffect(() => {
+    Promise.all([api.targets(), api.sessions(), api.skills()]).then(([targets, sessions, skills]) => {
+      setItems([
+        "/ Dashboard",
+        "/catalog Catalog",
+        "/sessions Debug Sessions",
+        "/queue Human Queue",
+        "/settings Settings & Skills",
+        ...targets.map((target) => `/catalog ${target.name} ${target.domain}`),
+        ...sessions.map((session) => `/sessions/${session.id} ${session.targetId} ${session.summary}`),
+        ...skills.map((skill) => `/settings ${skill.name}`),
+      ]);
+    }).catch(() => undefined);
+  }, []);
+  const visible = useMemo(() => items.filter((item) => item.toLowerCase().includes(query.toLowerCase())).slice(0, 12), [items, query]);
   return (
     <div className="palette">
       <input autoFocus placeholder="Search or jump to…" value={query} onChange={(event) => setQuery(event.target.value)} />
-      {items.filter((item) => item.toLowerCase().includes(query.toLowerCase())).map((item) => (
+      {visible.map((item) => (
         <button key={item} className="btn ghost" style={{ display: "block", width: "100%", textAlign: "left" }} onClick={() => { navigate(item.split(" ")[0]); onClose(); }}>{item}</button>
       ))}
     </div>

@@ -13,6 +13,7 @@ from langgraph.errors import GraphInterrupt
 from langgraph.types import Command
 
 from backend.agent.graph import GRAPH
+from backend.jdwp.engine import forget, get_engine
 from backend.skills.registry import delete_skill, get_skill, list_skills, save_skill
 from backend.store import STORE
 
@@ -40,7 +41,9 @@ def public_session(state: dict[str, Any]) -> dict[str, Any]:
         "startupScript": state.get("startup_script_path"),
         "startupText": state.get("startup_script_text"),
         "jdwpPort": state.get("discovered_jdwp_port"),
-        "jdwpConnected": state.get("jdwp_connected"),
+        "jdwpConnected": get_engine(state["session_id"]) is not None,
+        "sourceSnippet": state.get("source_snippet") or "",
+        "runtimeFamily": state.get("runtime_family") or "",
         "skills": state.get("active_skill_ids") or [],
         "extraContext": state.get("extra_context"),
         "pending": state.get("pending_human_approval"),
@@ -179,6 +182,64 @@ async def stream(session_id: str) -> StreamingResponse:
     return StreamingResponse(frames(), media_type="text/event-stream")
 
 
+@app.post("/api/sessions/{session_id}/debug")
+async def debug_action(session_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    engine = get_engine(session_id)
+    if engine is None or session_id not in STORE.sessions:
+        raise HTTPException(409, "No live JDWP session for this Debug Session")
+    action = str(body.get("action") or "")
+    if action == "print":
+        line = "print " + str(body.get("expression") or "")
+    elif action == "detach":
+        line = "exit"
+    elif action in {"step", "next", "cont", "locals", "where", "threads"}:
+        line = action
+    else:
+        raise HTTPException(400, "Unsupported debug action")
+    events = await engine.command(line)
+    hit = next((item for item in events if item.get("locals")), None)
+    for item in events:
+        if item.get("event") == "ready":
+            continue
+        STORE.emit(session_id, "jdwp_event", event=item.get("event"), command=item.get("command"), output=item.get("output") or item.get("detail") or "", detail=item)
+    if hit:
+        STORE.sessions[session_id]["captured_variables"] = [{"threadId": hit.get("thread") or "main", "frame": 0, "locals": hit.get("locals") or []}]
+        STORE.sessions[session_id]["thread_dumps"] = hit.get("frames") or []
+    if action == "detach":
+        forget(session_id)
+        STORE.sessions[session_id]["jdwp_connected"] = False
+    STORE.save()
+    return {"events": events, "session": public_session(STORE.sessions[session_id])}
+
+
+@app.patch("/api/sessions/{session_id}")
+def update_session(session_id: str, body: dict[str, Any]) -> dict[str, Any]:
+    state = STORE.sessions.get(session_id)
+    if not state:
+        raise HTTPException(404, "Debug Session not found")
+    if "extraContext" in body:
+        state["extra_context"] = body.get("extraContext") or ""
+    if "skillIds" in body:
+        state["active_skill_ids"] = body.get("skillIds") or []
+    STORE.save()
+    return public_session(state)
+
+
+@app.get("/api/settings")
+def read_settings() -> dict[str, str]:
+    return STORE.settings
+
+
+@app.put("/api/settings")
+def write_settings(body: dict[str, Any]) -> dict[str, str]:
+    if body.get("command"):
+        STORE.settings["command"] = str(body["command"])
+    if body.get("patterns"):
+        STORE.settings["patterns"] = str(body["patterns"])
+    STORE.save()
+    return STORE.settings
+
+
 @app.get("/api/queue")
 def queue() -> list[dict[str, Any]]:
     rows = []
@@ -186,6 +247,7 @@ def queue() -> list[dict[str, Any]]:
         pending = state.get("pending_human_approval")
         if not pending:
             continue
+        frame = next((item for item in state.get("parsed_frames") or [] if item.get("applicationFrame")), {})
         rows.append(
             {
                 "sessionId": state["session_id"],
@@ -194,6 +256,7 @@ def queue() -> list[dict[str, Any]]:
                 "summary": pending.get("summary"),
                 "waited": state.get("created_at"),
                 "diff": pending.get("diff"),
+                "line": f"{frame.get('className')}:{frame.get('line')}" if frame else "",
             }
         )
     return rows

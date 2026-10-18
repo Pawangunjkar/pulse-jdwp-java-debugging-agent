@@ -27,6 +27,8 @@ export type Session = {
   startupText?: string;
   jdwpPort?: number | null;
   jdwpConnected?: boolean;
+  sourceSnippet?: string;
+  runtimeFamily?: string;
   skills: string[];
   extraContext?: string;
   pending?: { kind: string; summary: string; diff?: string } | null;
@@ -51,6 +53,7 @@ export type QueueItem = {
   summary: string;
   waited?: string;
   diff?: string;
+  line?: string;
 };
 
 const STATUS_LABEL: Record<string, string> = {
@@ -107,4 +110,12 @@ export const api = {
   deleteSkill: (id: string) => json<{ deleted: boolean }>(`/api/skills/${id}`, { method: "DELETE" }),
   approve: (id: string, approved: boolean) =>
     json(`/api/queue/${id}/approve`, { method: "POST", body: JSON.stringify({ approved }) }),
+  debug: (id: string, action: string, expression = "") =>
+    json<{ session: Session; events: { kind?: string; event?: string; output?: string; command?: string; token?: string; detail?: unknown }[] }>(`/api/sessions/${id}/debug`, {
+      method: "POST",
+      body: JSON.stringify({ action, expression }),
+    }),
+  updateSession: (id: string, body: unknown) => json<Session>(`/api/sessions/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  settings: () => json<{ command: string; patterns: string }>("/api/settings"),
+  saveSettings: (body: unknown) => json<{ command: string; patterns: string }>("/api/settings", { method: "PUT", body: JSON.stringify(body) }),
 };

@@ -29,6 +29,7 @@ class DebugSessionState(TypedDict, total=False):
     approval: dict[str, Any] | None
     messages: Annotated[list, add_messages]
     root_cause_summary: str
+    source_snippet: str
     created_at: str
     events: list[dict[str, Any]]
     stepper: str

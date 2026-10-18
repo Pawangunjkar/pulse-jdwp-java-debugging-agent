@@ -23,6 +23,7 @@ class Store:
         self.targets: dict[str, dict[str, Any]] = {}
         self.sessions: dict[str, dict[str, Any]] = {}
         self.queues: dict[str, asyncio.Queue] = {}
+        self.settings: dict[str, str] = {"command": "uv", "patterns": "setenv.sh, start.sh, Dockerfile, *.service"}
         loaded = self._load()
         self._seed_targets()
         if not loaded:
@@ -38,6 +39,7 @@ class Store:
         payload = json.loads(DATA.read_text(encoding="utf-8"))
         self.targets = payload.get("targets") or {}
         self.sessions = payload.get("sessions") or {}
+        self.settings.update(payload.get("settings") or {})
         for session_id in self.sessions:
             self.queues[session_id] = asyncio.Queue()
         return True
@@ -49,7 +51,7 @@ class Store:
             plain = {key: value for key, value in state.items() if key != "messages"}
             plain["events"] = (plain.get("events") or [])[-500:]
             sessions[session_id] = plain
-        DATA.write_text(json.dumps({"targets": self.targets, "sessions": sessions}, indent=2), encoding="utf-8")
+        DATA.write_text(json.dumps({"targets": self.targets, "sessions": sessions, "settings": self.settings}, indent=2), encoding="utf-8")
 
     def _seed_targets(self) -> None:
         root = self._root()
@@ -63,6 +65,8 @@ class Store:
         ]
         for name, domain, script, prefix, port in samples:
             if name in self.targets:
+                if name.endswith("checkout") and not self.targets[name].get("sourceRoot"):
+                    self.targets[name]["sourceRoot"] = str(root / "samples" / "checkout" / "src")
                 continue
             self.targets[name] = {
                 "id": name,
@@ -72,6 +76,7 @@ class Store:
                 "packagePrefix": prefix,
                 "jdwpPort": port,
                 "host": "127.0.0.1",
+                "sourceRoot": str(root / "samples" / "checkout" / "src") if name.endswith("checkout") else "",
                 "skills": ["npe-root-cause-tracer"],
             }
         self._seed_sessions()

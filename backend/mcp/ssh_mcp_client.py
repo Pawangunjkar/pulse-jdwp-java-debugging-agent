@@ -6,6 +6,7 @@ import json
 import os
 import shlex
 from contextlib import AsyncExitStack
+from pathlib import Path
 from typing import Any
 
 from mcp import ClientSession, StdioServerParameters
@@ -74,14 +75,20 @@ class SshMcpClient:
 SSH = SshMcpClient()
 
 
-JDWP_FLAG = "-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:{port}"
+def jdwp_flag(port: int) -> str:
+    bind_all = os.environ.get("JDWP_BIND_ALL", "").lower() in {"1", "true", "yes"}
+    address = f"*:{port}" if bind_all else f"127.0.0.1:{port}"
+    return f"-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address={address}"
 
 
 def extract_port(script: str) -> int | None:
     import re
 
-    match = re.search(r"address=\*?:?(\d+)", script) or re.search(r"address=(\d+)", script)
-    return int(match.group(1)) if match else None
+    hosted = re.search(r"address=(?:\*|[\d.]+):(\d+)", script)
+    if hosted:
+        return int(hosted.group(1))
+    bare = re.search(r"address=(\d+)\b", script)
+    return int(bare.group(1)) if bare else None
 
 
 def server_family(script: str, path: str = "") -> str:
@@ -97,8 +104,20 @@ def server_family(script: str, path: str = "") -> str:
     return "JVM"
 
 
+def restart_command(family: str, script_path: str) -> str:
+    path = Path(script_path) if script_path else Path()
+    if family == "Tomcat":
+        bin_dir = path.parent if path.name == "setenv.sh" else path.parent / "bin"
+        return f"'{bin_dir / 'shutdown.sh'}'; '{bin_dir / 'startup.sh'}'"
+    if family == "WebLogic":
+        return f"'{path.parent / 'startWebLogic.sh'}'"
+    if family == "WebSphere":
+        return "startServer.sh server1"
+    return ""
+
+
 def inject_flag(script: str, port: int, path: str = "") -> str:
-    flag = JDWP_FLAG.format(port=port)
+    flag = jdwp_flag(port)
     if "jdwp" in script.lower():
         return script
     family = server_family(script, path)

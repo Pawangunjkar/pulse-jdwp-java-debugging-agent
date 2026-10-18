@@ -25,6 +25,7 @@ def _local_diagnosis(state: dict) -> str:
         f"Application frame {where} is the first owned frame in the pasted stack. "
         f"JDWP port {port} was the attach target. "
         f"Captured locals: {locals_text}. "
+        f"Source around the stop: {state.get('source_snippet') or 'source root not configured'}. "
         f"Skill guidance says to name the null or failed payload instead of guessing a fix. "
         f"Next change: guard the null local before the line above, then rerun the same stack."
     )

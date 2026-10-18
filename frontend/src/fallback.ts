@@ -79,6 +79,7 @@ export function fallbackGet(path: string): unknown {
   }
   if (path === "/api/targets") return withLatest();
   if (path === "/api/skills") return skills;
+  if (path === "/api/settings") return { command: "uv", patterns: "setenv.sh, start.sh, Dockerfile, *.service" };
   if (path === "/api/queue") {
     return sessions.filter((item) => item.pending).map((item) => ({
       sessionId: item.id,
@@ -87,6 +88,7 @@ export function fallbackGet(path: string): unknown {
       summary: item.pending?.summary || item.summary,
       waited: item.createdAt,
       diff: item.pending?.diff,
+      line: item.frames[0] ? `${item.frames[0].className}:${item.frames[0].line}` : "",
     })) satisfies QueueItem[];
   }
   if (path.startsWith("/api/sessions/") && !path.endsWith("/stream")) {
@@ -101,6 +103,12 @@ export function fallbackGet(path: string): unknown {
 }
 
 export function fallbackWrite(path: string, method: string, body: Record<string, unknown>): unknown {
+  if (path === "/api/settings" && method === "PUT") return { command: String(body.command || "uv"), patterns: String(body.patterns || "") };
+  if (method === "PATCH" && path.startsWith("/api/sessions/")) {
+    const session = sessions.find((item) => item.id === path.split("/")[3]);
+    if (session && "extraContext" in body) session.extraContext = String(body.extraContext || "");
+    return session;
+  }
   if (path === "/api/sessions" && method === "POST") {
     const session: Session = {
       id: Math.random().toString(16).slice(2, 10),

@@ -1,8 +1,8 @@
-"""JDWP session controller.
+"""Long-lived JDWP session.
 
-Attaches with the JDK's JDI tools (com.sun.jdi.SocketAttach) so Tomcat, WebLogic,
-WebSphere, and a plain JVM all use the same handshake. Set JDWP_SIMULATE=true to
-exercise the console when no debug port is listening.
+The helper process stays attached until the operator detaches. Commands are
+step, next, cont, locals, where, threads, and print. Compilation uses the
+running JDK's jdk.jdi module when tools.jar is absent.
 """
 
 from __future__ import annotations
@@ -10,28 +10,57 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
 HELPER = Path(__file__).resolve().parent / "AgentDebug.java"
 CLASSES = Path(__file__).resolve().parent / "classes"
+SECRET = re.compile(r"password|passwd|secret|token|pan|cvv|authorization|api[-_]?key", re.I)
+OPEN: dict[str, "JdwpEngine"] = {}
+_COMPILE: list[str] | None = None
 
 
 def jdk_home() -> Path | None:
-    candidates = []
+    candidates: list[Path] = []
     if os.environ.get("JAVA_HOME"):
         candidates.append(Path(os.environ["JAVA_HOME"]))
-    candidates.append(Path(r"C:\Program Files\Java\jdk1.8.0_202"))
     java = shutil.which("java")
     if java:
         candidates.append(Path(java).resolve().parents[1])
+    candidates.append(Path(r"C:\Program Files\Java\jdk1.8.0_202"))
     for home in candidates:
         binary = home / "bin" / ("java.exe" if os.name == "nt" else "java")
-        tools = home / "lib" / "tools.jar"
-        if binary.is_file() and tools.is_file():
+        if binary.is_file() and (_has_jdi_module(binary) or (home / "lib" / "tools.jar").is_file()):
             return home
     return None
+
+
+def _has_jdi_module(java: Path) -> bool:
+    try:
+        listing = subprocess.run([str(java), "--list-modules"], capture_output=True, text=True, timeout=20, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return "jdk.jdi" in listing.stdout
+
+
+def redact_locals(locals_: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    cleaned = []
+    for item in locals_ or []:
+        name = str(item.get("name", ""))
+        value = item.get("value")
+        if SECRET.search(name):
+            value = "***"
+        cleaned.append({**item, "value": value})
+    return cleaned
+
+
+def redact_event(event: dict[str, Any]) -> dict[str, Any]:
+    if "locals" in event:
+        event = {**event, "locals": redact_locals(event.get("locals"))}
+    return event
 
 
 class JdwpEngine:
@@ -39,124 +68,148 @@ class JdwpEngine:
         self.proc: asyncio.subprocess.Process | None = None
         self.host = ""
         self.port = 0
-        self._lines: list[dict[str, Any]] = []
+        self.mode = "jdi"
 
     @property
     def simulate(self) -> bool:
         return os.environ.get("JDWP_SIMULATE", "true").lower() in {"1", "true", "yes"}
 
-    async def attach_session(self, host: str, jdwp_port: int, source_paths: list[str] | None = None) -> dict[str, Any]:
-        self.host = host
-        self.port = jdwp_port
-        if self.simulate:
-            return {"connected": True, "mode": "simulate", "detail": f"Simulated attach {host}:{jdwp_port}", "sourcePaths": source_paths or []}
-        if jdk_home() is None:
-            return {"connected": False, "mode": "unavailable", "detail": "JDK with lib/tools.jar was not found. Set JAVA_HOME to a JDK 8+ home that contains tools.jar."}
-        return {"connected": True, "mode": "jdi", "detail": f"JDI SocketAttach ready for {host}:{jdwp_port}", "sourcePaths": source_paths or []}
-
-    async def inspect(self, host: str, port: int, breakpoints: list[tuple[str, int]], exception: str | None = None) -> dict[str, Any]:
+    async def open(self, host: str, port: int) -> dict[str, Any]:
         self.host = host
         self.port = port
         if self.simulate or port <= 0:
-            return self._simulated(breakpoints)
-        home = jdk_home()
-        if home is None:
-            return {"connected": False, "mode": "unavailable", "detail": "JDK with tools.jar was not found", "events": [], "locals": [], "frames": [], "threads": []}
-        java = home / "bin" / ("java.exe" if os.name == "nt" else "java")
-        javac = home / "bin" / ("javac.exe" if os.name == "nt" else "javac")
-        tools = home / "lib" / "tools.jar"
-        CLASSES.mkdir(parents=True, exist_ok=True)
-        compile = await asyncio.create_subprocess_exec(
-            str(javac),
-            "-cp",
-            str(tools),
-            "-d",
-            str(CLASSES),
-            str(HELPER),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        compile_out = (await compile.stdout.read()).decode(errors="replace") if compile.stdout else ""
-        if await compile.wait() != 0:
-            return {"connected": False, "mode": "jdi", "detail": compile_out[-400], "events": [], "locals": [], "frames": [], "threads": []}
-        separator = ";" if os.name == "nt" else ":"
-        command = [
-            str(java),
-            "-cp",
-            f"{CLASSES}{separator}{tools}",
-            "com.pulse.jdwp.AgentDebug",
+            self.mode = "simulate"
+            return {"connected": True, "mode": "simulate", "events": [{"event": "attach", "command": f"simulate {host}:{port}", "output": "simulated"}]}
+        launch = _launch_command()
+        if launch is None:
+            return {"connected": False, "mode": "unavailable", "detail": "No JDK with jdk.jdi or tools.jar was found", "events": []}
+        self.proc = await asyncio.create_subprocess_exec(
+            *launch,
             "--host",
             host,
             "--port",
             str(port),
-            "--timeout",
-            "8",
-        ]
-        if breakpoints:
-            command.extend(["--break", ",".join(f"{class_name}:{line}" for class_name, line in breakpoints)])
-        if exception:
-            command.extend(["--catch", exception])
-        self.proc = await asyncio.create_subprocess_exec(
-            *command,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+            stderr=asyncio.subprocess.PIPE,
         )
-        raw = await asyncio.wait_for(self.proc.stdout.read(), timeout=20) if self.proc.stdout else b""
-        await self.proc.wait()
-        events = []
-        for line in raw.decode(errors="replace").splitlines():
-            line = line.strip()
-            if line.startswith("{"):
-                try:
-                    events.append(json.loads(line))
-                except json.JSONDecodeError:
-                    events.append({"event": "output", "output": line})
-        hit = next((item for item in events if item.get("event") in {"breakpoint", "exception"} and item.get("locals")), None)
-        error = next((item for item in events if item.get("event") == "error"), None)
+        events = await self._read_until_ready()
         attach = next((item for item in events if item.get("event") == "attach"), None)
-        connected = attach is not None and hit is not None
+        error = next((item for item in events if item.get("event") == "error"), None)
         return {
-            "connected": connected,
+            "connected": attach is not None and error is None,
             "mode": "jdi",
-            "detail": (error or attach or {"output": raw.decode(errors="replace")[-400]}).get("detail") or (error or attach or {}).get("output", ""),
+            "detail": (error or {}).get("detail") or (attach or {}).get("output", ""),
             "events": events,
-            "locals": (hit or {}).get("locals") or [],
-            "frames": (hit or {}).get("frames") or [],
-            "threads": [(attach or {}).get("output", "")],
-            "thread": (hit or {}).get("thread", "main"),
         }
 
-    def _simulated(self, breakpoints: list[tuple[str, int]]) -> dict[str, Any]:
-        return {
-            "connected": True,
-            "mode": "simulate",
-            "detail": f"Simulated attach {self.host}:{self.port}",
-            "events": [{"event": "breakpoint", "command": f"stop at {name}:{line}", "output": "simulated"} for name, line in breakpoints],
-            "locals": [{"name": "taxable", "value": "null"}, {"name": "orderId", "value": "8c2e-demo"}],
-            "frames": ["CheckoutSaga.capture(CheckoutSaga.java:18)"],
-            "threads": ["main"],
-            "thread": "main",
-        }
+    async def command(self, line: str) -> list[dict[str, Any]]:
+        if self.mode == "simulate":
+            return [_simulated_command(line), {"event": "ready"}]
+        if self.proc is None or self.proc.stdin is None:
+            return [{"event": "error", "detail": "JDWP session is not open"}]
+        self.proc.stdin.write((line + "\n").encode())
+        await self.proc.stdin.drain()
+        events = await self._read_until_ready()
+        if line == "exit":
+            await self.close()
+        return events
 
-    async def set_breakpoint(self, class_name: str, line_number: int, condition: str | None = None) -> str:
-        return f"stop at {class_name}:{line_number}" + (f" if {condition}" if condition else "")
-
-    async def catch_exception(self, exception_class: str) -> str:
-        return f"catch {exception_class}"
-
-    async def inspect_threads_and_frames(self) -> str:
-        return "threads via JDI"
-
-    async def dump_local_variables(self, thread_id: str, frame_index: int) -> dict[str, Any]:
-        return {"threadId": thread_id, "frame": frame_index, "locals": []}
-
-    async def evaluate_expression(self, expression: str) -> str:
-        return expression
-
-    async def resume_or_step(self, action: str = "cont") -> str:
-        return action
+    async def _read_until_ready(self) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        if self.proc is None or self.proc.stdout is None:
+            return events
+        while True:
+            try:
+                raw = await asyncio.wait_for(self.proc.stdout.readline(), timeout=20)
+            except TimeoutError:
+                events.append({"event": "error", "detail": "Timed out waiting for the debugger"})
+                break
+            if not raw:
+                events.append({"event": "error", "detail": "Debugger process closed its output"})
+                break
+            text = raw.decode(errors="replace").strip()
+            if not text.startswith("{"):
+                continue
+            try:
+                event = redact_event(json.loads(text))
+            except json.JSONDecodeError:
+                event = {"event": "output", "output": text}
+            events.append(event)
+            if event.get("event") == "ready":
+                break
+        return events
 
     async def close(self) -> None:
         if self.proc and self.proc.returncode is None:
             self.proc.kill()
         self.proc = None
+
+
+def get_engine(session_id: str) -> JdwpEngine | None:
+    return OPEN.get(session_id)
+
+
+def remember(session_id: str, engine: JdwpEngine) -> None:
+    OPEN[session_id] = engine
+
+
+def forget(session_id: str) -> None:
+    OPEN.pop(session_id, None)
+
+
+def _launch_command() -> list[str] | None:
+    global _COMPILE
+    if _COMPILE:
+        return list(_COMPILE)
+    home = jdk_home()
+    if home is None:
+        return None
+    binary = "java.exe" if os.name == "nt" else "java"
+    compiler = "javac.exe" if os.name == "nt" else "javac"
+    java = home / "bin" / binary
+    javac = home / "bin" / compiler
+    tools = home / "lib" / "tools.jar"
+    CLASSES.mkdir(parents=True, exist_ok=True)
+    if _has_jdi_module(java):
+        compile = [str(javac), "--add-modules", "jdk.jdi", "-d", str(CLASSES), str(HELPER)]
+        run = [str(java), "--add-modules", "jdk.jdi", "-cp", str(CLASSES), "com.pulse.jdwp.AgentDebug"]
+    elif tools.is_file():
+        compile = [str(javac), "-cp", str(tools), "-d", str(CLASSES), str(HELPER)]
+        separator = ";" if os.name == "nt" else ":"
+        run = [str(java), "-cp", f"{CLASSES}{separator}{tools}", "com.pulse.jdwp.AgentDebug"]
+    else:
+        return None
+    compiled = subprocess.run(compile, capture_output=True, text=True, check=False)
+    if compiled.returncode != 0:
+        raise RuntimeError((compiled.stdout + compiled.stderr)[-500:])
+    _COMPILE = run
+    return list(run)
+
+
+def _simulated_command(line: str) -> dict[str, Any]:
+    locals_ = redact_locals([{"name": "taxable", "value": "null"}, {"name": "orderId", "value": "8c2e-demo"}])
+    frames = ["com.example.checkout.CheckoutSaga:18", "com.example.checkout.CheckoutSaga:9"]
+    if line.startswith("print "):
+        name = line.split(None, 1)[1]
+        value = next((item["value"] for item in locals_ if item["name"] == name), "not a visible local")
+        return {"event": "print", "command": line, "output": value}
+    return {"event": line.split()[0], "command": line, "output": "simulated", "locals": locals_, "frames": frames, "thread": "main"}
+
+
+def source_snippet(source_root: str, file_name: str, line: int, radius: int = 3) -> str:
+    if not source_root or not file_name or line <= 0:
+        return ""
+    root = Path(source_root)
+    matches = [root / file_name]
+    if root.is_dir():
+        matches.extend(root.rglob(file_name))
+    for path in matches:
+        if not path.is_file():
+            continue
+        rows = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        start = max(1, line - radius)
+        end = min(len(rows), line + radius)
+        picked = [f"{index}: {rows[index - 1]}" for index in range(start, end + 1)]
+        return "\n".join(picked)
+    return ""
